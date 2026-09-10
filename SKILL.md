@@ -38,6 +38,18 @@ the task takes to do, do the task.
 
 ## Preflight, In Order
 
+**0. One command for the whole setup.** [`setup.sh`](setup.sh) does steps 1–4 in one go: it adds the `gonkarouter` block
+to `config.yaml` (reading the key interactively via `read -s`, so it never reaches argv or the environment), starts the
+proxy if the port is closed, reads the local proxy token, and runs the callability canary. Run it after first installing
+CLIProxyAPI:
+
+```bash
+set +x
+bash setup.sh     # prints the alias to pass as --model on dispatch when the canary passes
+```
+
+Steps 1–4 below are what the script does, spelled out, so you can do it by hand or audit the script.
+
 **1. Bring the proxy up and get its token.** No shell alias is involved; these are the raw pieces.
 
 ```bash
@@ -189,6 +201,7 @@ env -u ANTHROPIC_API_KEY \
     --permission-mode acceptEdits \
     --max-turns 40 \
     --output-format json \
+    --disallowedTools Artifact mcp__stitch \
     < "<path to the brief>" \
     > "<log path>" 2>&1
 rc=$?
@@ -206,6 +219,9 @@ exit "$rc"
 - **Always wrap in `timeout`.** On a proxy error Claude Code retries for about three minutes before giving up, and a
   looping worker burns `--max-turns` worth of tokens. Exit 124 means the timeout fired
 - **`--max-turns`** is the budget. Forty is enough for a multi-file edit with tests; ten for a single-file rewrite
+- **The bearer token lands in the worker's environment.** `ANTHROPIC_AUTH_TOKEN="$CLIPROXY_TOKEN"` is visible in the
+  child's `/proc/<pid>/environ` (root always, same-user via `ps eww`). On a shared box, run the dispatch through a scoped
+  wrapper that unsets the token after `claude` exits, or drop the worker into its own user account
 
 ### Choosing `--permission-mode`
 
@@ -319,7 +335,7 @@ Fix small defects yourself. Re-dispatch only if a chunk is broadly wrong, with t
 | `<think>...</think>` in files or in the report           | MiniMax through GonkaRouter puts reasoning in the text stream. Use `deepseek-v4-flash-gonka`        |
 | HTTP 200 ends at `length`/`max_tokens` inside `<think>`  | Output was truncated before MiniMax's final answer; retry the same prompt with at least 512 output tokens and require a final answer plus a normal stop |
 | `<think>` comes out as ` thinking` in worker output      | DeepSeek on GonkaRouter rewrites the literal tag. Write it as `&lt;think&gt;` in briefs, or fix by hand   |
-| `400 ... schema pattern is not a valid regular expression` or `"$defs" is not allowed` | GonkaRouter validates tool schemas with Go RE2 and forbids `$defs`. Pass `--disallowedTools Artifact mcp__stitch`, or run under the empty config dir where no MCP tools load |
+| `400 ... schema pattern is not a valid regular expression` or `"$defs" is not allowed` | GonkaRouter validates tool schemas with Go RE2 and forbids `$defs`. Six tools trip it: `Artifact` (a `{1,4096}` repeat the parser rejects) plus five `mcp__stitch` tools (apply_design_system, create_design_system, create_design_system_from_design_md, generate_variants, update_design_system) that use `$defs`/`$ref`. Disallow all six with `--disallowedTools Artifact mcp__stitch` (prefix match strips the five stitch tools at once), or run under the empty config dir where no MCP tools load. The set is version-fragile: re-derive it when a Claude Code or plugin update adds a tool |
 | `429` from the proxy                                     | Over 1500 requests a minute sustained at GonkaRouter. Fewer workers, not retries; 429s are not billed |
 | Exit 124, `terminal_reason":"api_error`, nothing written | The proxy rejected every call and the harness retried until the timeout. Fix the proxy first        |
 | Saved worker exit code is not 0                          | A `timeout`, a proxy error-then-give-up, or a refused command. Trust the saved code, not the trailing `echo` |
