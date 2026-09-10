@@ -170,6 +170,13 @@ it, measured. `SKILL.md` shows the lines that add a model to the proxy.
 Inference on the Gonka network is priced around $0.0012 per million tokens, and it floats with network utilisation. A
 monthly token allowance, where one exists, is drawn down before paid credit and expires unused.
 
+**Measured baseline, 2026-09-10** (8 non-streaming canary calls per alias, concurrency 4, through the local proxy):
+
+| Alias                   | p50     | max      | Shape                                                        |
+| ----------------------- | ------- | -------- | ------------------------------------------------------------ |
+| `deepseek-v4-flash-gonka` | 173 ms | 769 ms  | Single distribution; no cold spike                           |
+| `minimax-m2.7`          | 143 ms  | 9.1 s    | Bimodal: ~140 ms cached, 1.5–9 s when it actually reasons    |
+
 ## How It Stays Safe
 
 A worker writes files under one of three permission modes:
@@ -188,6 +195,9 @@ A worker writes files under one of three permission modes:
 
 - **The Cost Figure Is Fictional.** The JSON result reports `total_cost_usd` as if Anthropic served the model, and the
   real usage is on the GonkaRouter dashboard, drawn from the monthly allowance first. Never quote the JSON figure.
+  There is no local meter to read instead: the proxy logs status and latency, not token counts, and GonkaRouter bills
+  the grant with no per-model breakdown exposed locally, so an honest local readout is a count of dispatch attempts,
+  not a per-token sum.
 - **The System Prompt Is Not Free.** A worker under your normal config dir costs 105,726 input tokens per turn against
   19,027 with an empty one, at twice the wall time, because it loads every plugin and hook you have.
 - **Six Concurrent Workers Is the Ceiling.** Past that they contend for the same files and the review cost exceeds the
@@ -233,7 +243,9 @@ exit "$rc"
 - **Always Redirect to a Log File.** The JSON result is the last line, several kilobytes long, and stderr warnings come
   before it. Read it with `tail -n 1`, never `tail -c`
 - **Always Wrap in `timeout`.** On a proxy error Claude Code retries for about three minutes before giving up, and a
-  looping worker burns `--max-turns` worth of credit. Exit 124 means the timeout fired
+  looping worker burns `--max-turns` worth of credit. Exit 124 means the timeout fired. The `1500` is `--max-turns`
+  tuned: ~40 turns × ~30 s per turn plus retry margin; raise it with the turn budget, or a slow worker gets cut off
+  mid-task without a result
 - **`--max-turns` Is the Budget.** Forty is enough for a multi-file edit with tests; ten for a single-file rewrite
 - **The Bearer Token Lands in the Worker's Environment.** `ANTHROPIC_AUTH_TOKEN="$CLIPROXY_TOKEN"` is visible in the
   child's `/proc/<pid>/environ` (root always, same-user via `ps eww`). On a shared box, run the dispatch through a scoped

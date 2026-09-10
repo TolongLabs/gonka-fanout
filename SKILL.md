@@ -185,6 +185,17 @@ a reported reliability defect, not a passing run. Report p95 and maximum latency
 without an SLA, latency is a measurement rather than a pass/fail claim. One slow cold call does not establish steady-state
 latency.
 
+**Measured baseline, 2026-09-10** (8 non-streaming canary calls per alias, concurrency 4, through the local proxy):
+
+| Alias                     | p50     | max      | Shape                                                    |
+| ------------------------- | ------- | -------- | -------------------------------------------------------- |
+| `deepseek-v4-flash-gonka` | 173 ms  | 769 ms   | Single distribution; no cold spike                       |
+| `minimax-m2.7`            | 143 ms  | 9.1 s    | Bimodal: ~140 ms cached, 1.5–9 s when it actually reasons |
+
+MiniMax's spread is the ` thinking` reasoning it emits before answering: short when the answer is cached or trivial, seconds
+when it reasons. DeepSeek's p50 is flattered by the tiny canary prompt; real work turns grow the ceiling. Treat these as
+order-of-magnitude expectations, not SLAs, and re-derive them when a provider or harness updates.
+
 ---
 
 ## Dispatch
@@ -217,7 +228,9 @@ exit "$rc"
 - **Always redirect to a log file.** The JSON result is the last line, several kilobytes long; stderr warnings come
   before it. Read it with `tail -n 1`, never `tail -c`
 - **Always wrap in `timeout`.** On a proxy error Claude Code retries for about three minutes before giving up, and a
-  looping worker burns `--max-turns` worth of tokens. Exit 124 means the timeout fired
+  looping worker burns `--max-turns` worth of tokens. Exit 124 means the timeout fired. The `1500` is `--max-turns` tuned:
+  ~40 turns × ~30 s per turn plus retry margin; raise it when you raise the turn budget, or a slow worker gets cut off
+  mid-task without a result
 - **`--max-turns`** is the budget. Forty is enough for a multi-file edit with tests; ten for a single-file rewrite
 - **The bearer token lands in the worker's environment.** `ANTHROPIC_AUTH_TOKEN="$CLIPROXY_TOKEN"` is visible in the
   child's `/proc/<pid>/environ` (root always, same-user via `ps eww`). On a shared box, run the dispatch through a scoped
@@ -279,7 +292,10 @@ Say **"do not run git"** in every brief. The worker can, and a commit from a wor
 ## Verifying, Which Is Not Optional
 
 The JSON result reports `total_cost_usd` as if Anthropic served the model. **It is fictional.** Real usage is on the
-GonkaRouter dashboard, drawn from the monthly allowance first. Never quote the JSON figure.
+GonkaRouter dashboard, drawn from the monthly allowance first. Never quote the JSON figure. There is no local meter to
+read instead: the proxy logs status and latency, not token counts, and GonkaRouter bills the grant with no per-model
+breakdown exposed locally. To answer "was this cheaper than the plan", count dispatch attempts — each proxy error
+retry, `count_tokens` call, and worker turn is still a request against the grant even when no `total_cost_usd` appears.
 
 Check, in this order:
 
