@@ -61,6 +61,7 @@ If a task needs your judgement or your conversation context, you do not need thi
    leaks into transcripts.
 
    ```bash
+   set +x  # never run secret-bearing preflight commands with shell tracing enabled
    CLIPROXY_DIR="${CLIPROXY_DIR:-$HOME/.cli-proxy-api}"
    CLIPROXY_PORT="${CLIPROXY_PORT:-8317}"
    CLIPROXY_TOKEN=$(grep -A1 '^api-keys:' "$CLIPROXY_DIR/config.yaml" | tail -1 | tr -d '" -')
@@ -92,6 +93,11 @@ If a task needs your judgement or your conversation context, you do not need thi
            display-name: "MiniMax M2.7 (Gonka)"
    ```
 
+1. **Prove the Selected Alias Is Callable.** A config entry or either `/v1/models` catalogue only advertises routing;
+   neither proves the account can run inference. Run the real Messages canary in
+   [`SKILL.md`, preflight step 4](SKILL.md#preflight-in-order), using 512 output tokens for MiniMax. Launch no workers
+   unless it returns HTTP 200, `stop_reason: end_turn`, and `READY` as the last non-empty text line.
+
 1. **Dispatch Your First Worker.** Export `CLAUDE_FANOUT_CONFIG` to an empty directory once per machine, so the worker
    does not load your plugins, hooks or memory. Then `cd` into the working directory, put the brief in a file, pick a
    model from the previous step, and dispatch:
@@ -111,7 +117,10 @@ If a task needs your judgement or your conversation context, you do not need thi
        --output-format json \
        < "<path to the brief>" \
        > "<log path>" 2>&1
-   echo "exit=$?"
+   rc=$?
+   printf '%s' "$rc" > "<exit code path>"
+   echo "exit=$rc"
+   exit "$rc"
    ```
 
 1. **Verify.** The `total_cost_usd` in the JSON result is fictional, because the proxy served the model, so never quote
@@ -119,12 +128,23 @@ If a task needs your judgement or your conversation context, you do not need thi
    from a worker proves the worker's tests agree with the worker's code and nothing else:
 
    ```bash
-   tail -n 1 "$LOG" | jq -r '.result, .num_turns, .permission_denials'      # its report, turns, refusals
-   git -C <worktree> status --porcelain                                   # what actually changed, including strays
-   grep -c "<structural marker>" <output>                                 # right shape, right count
-   grep -rn "/home/\|C:\\\\Users\|/tmp/" <output>                         # no machine paths leaked
-   grep -rn "<think>" <output>                                            # no leaked reasoning (MiniMax)
+   (
+     set -e
+     [ "$(cat "$EXIT_FILE")" = 0 ]                                   # saved exit code, not the trailing echo
+     RESULT=$(tail -n 1 "$LOG")
+     jq -e '.is_error == false and ((.permission_denials // []) | length == 0)' <<<"$RESULT" >/dev/null
+     jq -r '.result, .num_turns, .permission_denials' <<<"$RESULT"
+     git -C "$WORKTREE" status --porcelain | cmp -s "$EXPECTED_STATUS" -   # exact file set, no strays
+     [ "$(grep -cF "$STRUCTURAL_MARKER" "$OUTPUT")" -eq "$EXPECTED_COUNT" ]
+     cmp -s "$EXPECTED_FILE" "$OUTPUT"                                 # exact bytes, including final newline
+     if grep -rnE '/home/|C:\\Users|/tmp/' "$OUTPUT"; then exit 1; fi
+     if grep -rnF '<think>' "$OUTPUT"; then exit 1; fi
+   )
    ```
+
+   Create `EXPECTED_FILE` from the required fixture, including its intended newline bytes, and `EXPECTED_STATUS` as the
+   exact `git status --porcelain` you expect. The full reusable verifier is in
+   [`SKILL.md`](SKILL.md#verifying-which-is-not-optional).
 
 ## Which Model to Use
 
@@ -135,7 +155,7 @@ it, measured. `SKILL.md` shows the lines that add a model to the proxy.
 | Alias                     | GonkaRouter id                       | Context | Notes                                                        |
 | ------------------------- | ------------------------------------ | ------- | ------------------------------------------------------------ |
 | `deepseek-v4-flash-gonka` | `deepseek-ai/DeepSeek-V4-Flash-0731` | 1M      | **The default.** Clean text, clean tool calls                |
-| `minimax-m2.7`            | `MiniMaxAI/MiniMax-M2.7`             | 192k    | Reasoning arrives as literal `<think>` text inside every reply |
+| `minimax-m2.7`            | `MiniMaxAI/MiniMax-M2.7`             | 192k    | Literal `<think>` in every reply; low output limits may contain no final answer |
 
 Inference on the Gonka network is priced around $0.0012 per million tokens, and it floats with network utilisation. A
 monthly token allowance, where one exists, is drawn down before paid credit and expires unused.
@@ -166,8 +186,9 @@ A worker writes files under one of three permission modes:
   `--max-turns` worth of credit, which is why every dispatch wraps in `timeout`.
 - **A Worker Has None of Your Context.** Everything it needs goes in the brief, and if the brief takes longer to write
   than the task takes to do, do the task.
-- **MiniMax Leaks Its `<think>` Text.** Reasoning arrives as literal `<think>` text inside every reply, so grep for it
-  and prefer `deepseek-v4-flash-gonka` when the leak matters.
+- **MiniMax Leaks Its `<think>` Text.** Reasoning arrives as literal `<think>` text inside every reply. A low output
+  limit can end at `length`/`max_tokens` before any final answer; retry with at least 512 tokens before calling that a
+  reliability failure. Prefer `deepseek-v4-flash-gonka` when the leak matters.
 
 ## Under the Hood
 
@@ -188,7 +209,10 @@ env -u ANTHROPIC_API_KEY \
     --output-format json \
     < "<path to the brief>" \
     > "<log path>" 2>&1
-echo "exit=$?"
+rc=$?
+printf '%s' "$rc" > "<exit code path>"
+echo "exit=$rc"
+exit "$rc"
 ```
 
 - **`-p` Reads the Brief From stdin.** Put the brief in a file; an inline prompt of any length is shell-quoting
@@ -210,7 +234,10 @@ echo "exit=$?"
 | -------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
 | `auth_unavailable: no auth available (providers=...)`    | You named a model outside the `gonkarouter` block, and its login is dead. Use a GonkaRouter alias   |
 | `'<model>' is not served` or model id rejected           | The `gonkarouter` block is missing or the alias is misspelt. Re-run preflight step 2                 |
+| Config and `/v1/models` look good, but inference fails   | Catalogues advertise routing, not callability. Run the real Messages canary; launch none unless it passes |
+| Python `urllib` gets `403` with `error code: 1010`       | Treat it as an inconclusive Cloudflare client/edge rejection, not a key verdict. Repeat the same request and credential from the same host with `curl`, `requests`, or `httpx`; call it client-specific only after one succeeds |
 | `<think>...</think>` in files or in the report           | MiniMax through GonkaRouter puts reasoning in the text stream. Use `deepseek-v4-flash-gonka`        |
+| HTTP 200 ends at `length`/`max_tokens` inside `<think>`  | The output was truncated before MiniMax's final answer. Retry with at least 512 output tokens and require a normal stop |
 | `<think>` comes out as ` thinking` in worker output      | DeepSeek on GonkaRouter rewrites the literal tag. Write it as `&lt;think&gt;` in briefs, or fix by hand   |
 | `400 ... schema pattern is not a valid regular expression` or `"$defs" is not allowed` | GonkaRouter validates tool schemas with Go RE2 and forbids `$defs`. Pass `--disallowedTools Artifact mcp__stitch`, or run under the empty config dir where no MCP tools load |
 | `429` from the proxy                                     | Over 1500 requests a minute sustained at GonkaRouter. Fewer workers, not retries; 429s are not billed |
@@ -219,6 +246,9 @@ echo "exit=$?"
 | `claude.ai connectors are disabled` on stderr            | Harmless. `ANTHROPIC_AUTH_TOKEN` takes precedence over the login, which is the point                |
 | Every turn costs ~100k input tokens                      | The worker ran under your normal config dir. Set `CLAUDE_CONFIG_DIR` to the empty one               |
 | Stray files or a commit in the repo                      | The brief did not say "and nothing else" or "do not run git". `git status` after every run          |
+| Report says success, but exact content differs           | Reports are not byte verification. Compare an expected fixture file with the output using `cmp -s`, and test its exit status |
+| Worker created extra files                               | The brief did not say "and nothing else", and the verifier never asserted the file set. Save the exit code and compare `git status --porcelain` against an `EXPECTED_STATUS` fixture |
+| Saved worker exit code is not 0                          | A `timeout`, a proxy error-then-give-up, or a refused command. Trust the saved code, not the trailing `echo` |
 | `permission_denials` is non-empty                        | `acceptEdits` refused a command. Either allow it with `--allowedTools` or do that step yourself     |
 
 </details>
