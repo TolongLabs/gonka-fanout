@@ -94,6 +94,9 @@ If a task needs your judgement or your conversation context, you do not need thi
        api-key-entries:
          - api-key: "sk-..."
        models:
+         - name: "zai-org/GLM-5.3-Flash"
+           alias: "glm-5.3-flash-gonka"
+           display-name: "GLM 5.3 Flash (Gonka)"
          - name: "deepseek-ai/DeepSeek-V4-Flash-0731"
            alias: "deepseek-v4-flash-gonka"
            display-name: "DeepSeek V4 Flash (Gonka)"
@@ -104,8 +107,15 @@ If a task needs your judgement or your conversation context, you do not need thi
 
 1. **Prove the Selected Alias Is Callable.** A config entry or either `/v1/models` catalogue only advertises routing;
    neither proves the account can run inference. Run the real Messages canary in
-   [`SKILL.md`, preflight step 4](SKILL.md#preflight-in-order), using 512 output tokens for MiniMax. Launch no workers
-   unless it returns HTTP 200, `stop_reason: end_turn`, and `READY` as the last non-empty text line.
+   [`SKILL.md`, preflight step 4](SKILL.md#preflight-in-order), using 1024 output tokens for GLM. Launch no workers
+   unless it returns HTTP 200, `stop_reason: end_turn`, and `READY` as the last non-empty text line. DeepSeek and MiniMax
+   fail this canary — DeepSeek loops, MiniMax never reaches the marker — which is the expected result, not a config error.
+
+   **Request ceiling: ~200,000 tokens, input plus `max_tokens`.** The gateway rejects anything larger with
+   `accepts up to about 200000 tokens (input plus max_tokens)`. This is a gateway limit, not a model window, and it
+   applies before the request reaches the model. Claude Code sizes any non-Claude model at 200k, so a long session can
+   trip it while the harness thinks there is room left. Keep `input + max_tokens` under 200000, and if a dispatch fails
+   near the ceiling, shrink the brief rather than raising `max_tokens`.
 
 1. **Dispatch Your First Worker.** Export `CLAUDE_FANOUT_CONFIG` to an empty directory once per machine, so the worker
    does not load your plugins, hooks or memory. Then `cd` into the working directory, put the brief in a file, pick a
@@ -120,7 +130,7 @@ If a task needs your judgement or your conversation context, you do not need thi
      ANTHROPIC_BASE_URL="http://127.0.0.1:$CLIPROXY_PORT" \
      ANTHROPIC_AUTH_TOKEN="$CLIPROXY_TOKEN" \
      timeout 1500 claude -p \
-       --model "${MODEL:-deepseek-v4-flash-gonka}" \
+       --model "${MODEL:-glm-5.3-flash-gonka}" \
        --permission-mode acceptEdits \
        --max-turns 40 \
        --output-format json \
@@ -158,24 +168,45 @@ If a task needs your judgement or your conversation context, you do not need thi
 
 ## Which Model to Use
 
-Only models in the `gonkarouter` block of the proxy config are offered, and `deepseek-v4-flash-gonka` is the default:
-dispatch on it without asking. Reasoning effort is inert on both: GonkaRouter accepts `reasoning_effort` and ignores
-it, measured. `SKILL.md` shows the lines that add a model to the proxy.
+Only models in the `gonkarouter` block of the proxy config are offered, and `glm-5.3-flash-gonka` is the default:
+dispatch on it without asking. Reasoning effort is inert on all three: GonkaRouter accepts `reasoning_effort` and
+ignores it, measured. `SKILL.md` shows the lines that add a model to the proxy.
 
-| Alias                     | GonkaRouter id                       | Context | Notes                                                        |
-| ------------------------- | ------------------------------------ | ------- | ------------------------------------------------------------ |
-| `deepseek-v4-flash-gonka` | `deepseek-ai/DeepSeek-V4-Flash-0731` | 1M      | **The default.** Clean text, clean tool calls                |
-| `minimax-m2.7`            | `MiniMaxAI/MiniMax-M2.7`             | 192k    | Literal `<think>` in every reply; low output limits may contain no final answer |
+| Alias                     | GonkaRouter id                       | Context | Status                                                                          |
+| ------------------------- | ------------------------------------ | ------- | ------------------------------------------------------------------------------ |
+| `glm-5.3-flash-gonka`     | `zai-org/GLM-5.3-Flash`              | —       | **The default, and the only usable one.** Usable, but verify every worker's output |
+| `deepseek-v4-flash-gonka` | `deepseek-ai/DeepSeek-V4-Flash-0731` | 1M      | **Broken — do not dispatch.** Degenerate-loops on trivial prompts                |
+| `minimax-m2.7`            | `MiniMaxAI/MiniMax-M2.7`             | 192k    | **Broken — do not dispatch.** Reasoning inlined as literal `<think>` text         |
+
+DeepSeek and MiniMax fail **upstream at GonkaRouter** — they misbehave identically when called directly, with no proxy
+in the path, so no proxy config can rescue them. If you explicitly want one, expect unusable output.
+
+**CLIProxyAPI must be 7.3.5 or newer — necessary, but not sufficient.** On 7.2.x and older, GLM's own reasoning leaks
+into the visible text on `/v1/messages`, prefixed with `</arg_value><arg_key>.model="">` — it reads as a thinking log and
+burns output budget. Commit `77820cb2` (issue #5872) fixed that on 7.3.5. Check with `cli-proxy-api --help | head -1`.
+
+On 7.3.15 the reasoning now lands in a proper `thinking` block, but the `text` block still picks up fragments of it and
+stray tool-call framing on roughly two responses in three. Measured on `Reply with exactly: 4` at 1024 output tokens:
+**upstream direct 8/8 clean, through the proxy 7/19 clean.** It is a proxy-side translation defect and no config key
+fixes it — `is-compat: true` measured 1/10 clean, `thinking: levels` 400s because Claude Code sends `level: "high"`, and
+`max-context-length` is Codex-only metadata. So verify each worker's written output rather than trusting the exit code.
+
+GLM needs a larger output budget than a stock canary would use: at 64 output tokens it returns HTTP 200 with an empty
+text block and `stop_reason: "max_tokens"`, so a canary that only checks the status code passes a response with no answer
+in it. Budget 1024 for GLM and require `stop_reason: end_turn` plus the final marker.
 
 Inference on the Gonka network is priced around $0.0012 per million tokens, and it floats with network utilisation. A
 monthly token allowance, where one exists, is drawn down before paid credit and expires unused.
 
-**Measured baseline, 2026-09-10** (8 non-streaming canary calls per alias, concurrency 4, through the local proxy):
+**Measured baselines** (8 non-streaming canary calls per alias, concurrency 4, through the local proxy):
 
-| Alias                   | p50     | max      | Shape                                                        |
-| ----------------------- | ------- | -------- | ------------------------------------------------------------ |
-| `deepseek-v4-flash-gonka` | 173 ms | 769 ms  | Single distribution; no cold spike                           |
-| `minimax-m2.7`          | 143 ms  | 9.1 s    | Bimodal: ~140 ms cached, 1.5–9 s when it actually reasons    |
+| Alias                   | p50     | max      | Status                                                                           |
+| ----------------------- | ------- | -------- | -------------------------------------------------------------------------------- |
+| `glm-5.3-flash-gonka`   | 85 ms   | 88 ms    | 2026-09-24, 8/8 `end_turn`, marker intact, no reasoning in text                  |
+| `deepseek-v4-flash-gonka` | 173 ms | 769 ms  | Latency is fine; output is not. Degenerate-loops (`4 4 4 …`) on trivial prompts |
+| `minimax-m2.7`          | 143 ms  | 9.1 s    | Latency is fine; output is not. Every reply opens with literal `<think>` text    |
+
+The DeepSeek and MiniMax latency figures are stale-but-harmless: both respond fast and both return unusable text.
 
 ## How It Stays Safe
 
@@ -190,6 +221,14 @@ A worker writes files under one of three permission modes:
 - **Give a Worker a `git worktree`, Never Your Checkout.** A half-done or looping run then costs one worktree removal,
   not a reconstruction, and two workers never share a working tree.
 - **Say `do not run git` in Every Brief.** The worker can, and a commit from a worker is a commit nobody reviewed.
+- **Ignore the worker's `result` text — it carries a thinking log.** Across dispatches of a one-line file-write task the
+  written file was byte-exact every time, while `.result` came back prefixed with a `<think>` monologue 3 times out of
+  3. It is a status string, not a deliverable: judge the worker on the files it wrote and on `.is_error`, never on what
+  it claims it did, and never paste it into a report to the user.
+- **The gateway caps every request at ~200,000 tokens, `input + max_tokens` combined** (`accepts up to about 200000
+  tokens (input plus max_tokens)`). Fan out wide rather than deep: slice work into more, smaller workers instead of
+  giving one worker a large brief. When a dispatch fails at the ceiling, split the task — raising `max_tokens` makes it
+  worse.
 
 ## What It Cannot Do
 
@@ -206,9 +245,9 @@ A worker writes files under one of three permission modes:
   `--max-turns` worth of credit, which is why every dispatch wraps in `timeout`.
 - **A Worker Has None of Your Context.** Everything it needs goes in the brief, and if the brief takes longer to write
   than the task takes to do, do the task.
-- **MiniMax Leaks Its `<think>` Text.** Reasoning arrives as literal `<think>` text inside every reply. A low output
-  limit can end at `length`/`max_tokens` before any final answer; retry with at least 512 tokens before calling that a
-  reliability failure. Prefer `deepseek-v4-flash-gonka` when the leak matters.
+- **Two Of The Three Models Are Broken.** DeepSeek degenerates into `4 4 4 …` loops and MiniMax inlines its reasoning
+  as literal `<think>` text. Both are GonkaRouter-side faults — they reproduce with the proxy removed entirely — so
+  no amount of proxy configuration fixes them. Dispatch on `glm-5.3-flash-gonka`, the only model that behaves.
 
 ## Under the Hood
 
@@ -223,7 +262,7 @@ env -u ANTHROPIC_API_KEY \
   ANTHROPIC_BASE_URL="http://127.0.0.1:$CLIPROXY_PORT" \
   ANTHROPIC_AUTH_TOKEN="$CLIPROXY_TOKEN" \
   timeout 1500 claude -p \
-    --model "${MODEL:-deepseek-v4-flash-gonka}" \
+    --model "${MODEL:-glm-5.3-flash-gonka}" \
     --permission-mode acceptEdits \
     --max-turns 40 \
     --output-format json \
@@ -262,9 +301,12 @@ exit "$rc"
 | `'<model>' is not served` or model id rejected           | The `gonkarouter` block is missing or the alias is misspelt. Re-run preflight step 2                 |
 | Config and `/v1/models` look good, but inference fails   | Catalogues advertise routing, not callability. Run the real Messages canary; launch none unless it passes |
 | Python `urllib` gets `403` with `error code: 1010`       | Treat it as an inconclusive Cloudflare client/edge rejection, not a key verdict. Repeat the same request and credential from the same host with `curl`, `requests`, or `httpx`; call it client-specific only after one succeeds |
-| `<think>...</think>` in files or in the report           | MiniMax through GonkaRouter puts reasoning in the text stream. Use `deepseek-v4-flash-gonka`        |
-| HTTP 200 ends at `length`/`max_tokens` inside `<think>`  | The output was truncated before MiniMax's final answer. Retry with at least 512 output tokens and require a normal stop |
-| `<think>` comes out as ` thinking` in worker output      | DeepSeek on GonkaRouter rewrites the literal tag. Write it as `&lt;think&gt;` in briefs, or fix by hand   |
+| `<think>...</think>` in files or in the report           | MiniMax inlines reasoning in the text stream. Use `glm-5.3-flash-gonka`; MiniMax is not repairable by config |
+| Output repeats one token over and over (`4 4 4 …`)     | DeepSeek degenerate-loops on GonkaRouter, upstream. Use `glm-5.3-flash-gonka`; not repairable by config      |
+| GLM canary passes the status check but the text is empty | GLM spent the whole budget before answering: at 64 output tokens it returns HTTP 200, `stop_reason: "max_tokens"`, and no text. Require `end_turn` *and* the `READY` marker, and budget 1024 for GLM |
+| Reasoning text appears in the answer with no `<think>`   | Below 7.3.5 GLM's reasoning leaks wholesale. Upgrade, then still expect ~2-in-3 leaks; re-dispatch the chunk |
+| Worker exits 0 but its output is prose, `<arg_value>`, or off-brief text | GLM's text block is contaminated ~2 in 3 on 7.3.15. Not a worker bug — verify and re-dispatch            |
+| `accepts up to about 200000 tokens (input plus max_tokens)` | Gateway ceiling. Split into more, smaller workers — do NOT raise `max_tokens`. See the 200k section       |
 | `400 ... schema pattern is not a valid regular expression` or `"$defs" is not allowed` | GonkaRouter validates tool schemas with Go RE2 and forbids `$defs`. Six tools trip it: `Artifact` (a `{1,4096}` repeat the parser rejects) plus five `mcp__stitch` tools (apply_design_system, create_design_system, create_design_system_from_design_md, generate_variants, update_design_system) that use `$defs`/`$ref`. Disallow all six with `--disallowedTools Artifact mcp__stitch`, or run under the empty config dir where no MCP tools load. The set is version-fragile: re-derive it when a Claude Code or plugin update adds a tool |
 | `429` from the proxy                                     | Over 1500 requests a minute sustained at GonkaRouter. Fewer workers, not retries; 429s are not billed |
 | Exit 124, `terminal_reason":"api_error`, nothing written | The proxy rejected every call and the harness retried until the timeout. Fix the proxy first        |
