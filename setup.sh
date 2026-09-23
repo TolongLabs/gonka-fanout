@@ -19,9 +19,9 @@ CONFIG="$CLIPROXY_DIR/config.yaml"
 PROXY_URL="http://127.0.0.1:$CLIPROXY_PORT"
 
 # Default model ids; override with environment if the provider serves different ones.
-GONKA_MODEL_ID="${GONKA_MODEL_ID:-deepseek-ai/DeepSeek-V4-Flash-0731}"
-GONKA_ALIAS="${GONKA_ALIAS:-deepseek-v4-flash-gonka}"
-GONKA_DISPLAY="${GONKA_DISPLAY:-DeepSeek V4 Flash (Gonka)}"
+GONKA_MODEL_ID="${GONKA_MODEL_ID:-zai-org/GLM-5.3-Flash}"
+GONKA_ALIAS="${GONKA_ALIAS:-glm-5.3-flash-gonka}"
+GONKA_DISPLAY="${GONKA_DISPLAY:-GLM 5.3 Flash (Gonka)}"
 
 err() { echo "gonka-setup: error: $*" >&2; exit 1; }
 info() { echo "gonka-setup: $*"; }
@@ -65,7 +65,11 @@ CLIPROXY_TOKEN=$(grep -A1 '^api-keys:' "$CONFIG" | tail -1 | tr -d '" -')
 [ -n "$CLIPROXY_TOKEN" ] || err "could not read proxy token from $CONFIG"
 
 # --- 4. Canary: prove the alias is callable through the Messages path workers use. ----
+# GLM returns HTTP 200 with an empty text block at 64 output tokens, so a status-only
+# check passes a response with no answer. Budget it 1024 and require a real final marker.
 PROBE_MAX_TOKENS=64
+[ "$GONKA_ALIAS" = "minimax-m2.7" ] && PROBE_MAX_TOKENS=512
+[ "$GONKA_ALIAS" = "glm-5.3-flash-gonka" ] && PROBE_MAX_TOKENS=1024
 PROBE_BODY=$(mktemp)
 trap 'rm -f "$PROBE_BODY"' EXIT
 exec {PROBE_HEADER_FD}<<<"header = \"Authorization: Bearer $CLIPROXY_TOKEN\""
